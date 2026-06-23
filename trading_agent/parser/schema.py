@@ -21,3 +21,22 @@ class ParsedQuery(BaseModel):
     ticker: str
     conditions: list[NumericConditionInput] = Field(min_length=1)
     logic: Literal["AND", "OR"]
+
+
+ValidationReason = Literal[
+    "unknown_ticker",
+    "ambiguous_ticker",
+    "ambiguous_logic",
+    "missing_info",
+    "contradictory",
+    "other",
+]
+
+
+class ValidationAssessment(BaseModel):
+    """Semantic validation result from the LLM in validate_node."""
+    is_valid: bool
+    needs_clarification: bool
+    clarification_question: str | None = None
+    reason: ValidationReason | None = None
+    issues: list[str] = Field(default_factory=list)

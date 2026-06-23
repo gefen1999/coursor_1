@@ -4,8 +4,8 @@ from dotenv import load_dotenv
 
 from core import ActionType, ComparisonOperator, LogicMode, NumericCondition, TradingQuery
 from parser.graph_state import ParserState
-from parser.prompts import SYSTEM_PROMPT
-from parser.schema import ParsedQuery
+from parser.prompts import SYSTEM_PROMPT, VALIDATION_PROMPT
+from parser.schema import ParsedQuery, ValidationAssessment
 
 
 def _call_ollama(raw_text: str) -> ParsedQuery:
@@ -27,6 +27,30 @@ def _call_ollama(raw_text: str) -> ParsedQuery:
     return ParsedQuery.model_validate_json(content)
 
 
+def _call_ollama_validation(raw_text: str, parsed_query: ParsedQuery) -> ValidationAssessment:
+    from ollama import Client
+
+    host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+    model = os.getenv("OLLAMA_MODEL", "llama3.1")
+
+    user_content = (
+        f"Original query:\n{raw_text}\n\n"
+        f"Parsed JSON:\n{parsed_query.model_dump_json(indent=2)}"
+    )
+
+    client = Client(host=host)
+    response = client.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": VALIDATION_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        format=ValidationAssessment.model_json_schema(),
+    )
+    content = response["message"]["content"]
+    return ValidationAssessment.model_validate_json(content)
+
+
 def parse_node(state: ParserState) -> ParserState:
     """
     Sends state["raw_text"] + the system prompt (from prompts.py) to the
@@ -36,10 +60,6 @@ def parse_node(state: ParserState) -> ParserState:
     """
     load_dotenv()
     raw_text = state["raw_text"]
-
-    # TODO: implement clarification loop — if the query is ambiguous, set
-    # needs_clarification=True and route back to ask_user_node instead of
-    # calling the LLM again with the same text.
 
     try:
         parsed_query = _call_ollama(raw_text)
@@ -51,23 +71,30 @@ def parse_node(state: ParserState) -> ParserState:
     return state
 
 
+def _build_trading_query(state: ParserState, parsed: ParsedQuery) -> TradingQuery:
+    conditions = [
+        NumericCondition(
+            ticker=cond.ticker.strip(),
+            operator=ComparisonOperator(cond.operator),
+            value=cond.value,
+        )
+        for cond in parsed.conditions
+    ]
+
+    return TradingQuery(
+        action=ActionType(parsed.action),
+        ticker=parsed.ticker.strip(),
+        conditions=conditions,
+        logic=LogicMode(parsed.logic),
+        raw_text=state["raw_text"],
+    )
+
+
 def validate_node(state: ParserState) -> ParserState:
     """
-    Builds a TradingQuery directly from parsed_query - this is now a
-    straightforward field-by-field mapping, NOT tree construction:
-        - action: ParsedQuery.action -> TradingQuery.action
-        - ticker: ParsedQuery.ticker -> TradingQuery.ticker
-        - conditions: each NumericConditionInput -> a core.NumericCondition
-          (ticker, operator, value - direct copy, no wrapping)
-        - logic: ParsedQuery.logic -> TradingQuery.logic
-        - raw_text: state["raw_text"] -> TradingQuery.raw_text
-
-    Also do basic semantic validation before building (e.g. ticker is a
-    non-empty string, conditions list is non-empty - Pydantic already
-    covers most of this during parse, this is a light extra check).
-
-    Updates state["trading_query"] with the result, or
-    state["validation_errors"] if it fails.
+    Phase A: fast structural checks on parsed_query.
+    Phase B: semantic validation via LLM (ValidationAssessment).
+    Phase C: map to TradingQuery or set clarification / error flags.
     """
     parsed = state.get("parsed_query")
     if parsed is None:
@@ -91,20 +118,26 @@ def validate_node(state: ParserState) -> ParserState:
         state["validation_errors"].extend(errors)
         return state
 
-    conditions = [
-        NumericCondition(
-            ticker=cond.ticker.strip(),
-            operator=ComparisonOperator(cond.operator),
-            value=cond.value,
-        )
-        for cond in parsed.conditions
-    ]
+    try:
+        assessment = _call_ollama_validation(state["raw_text"], parsed)
+    except Exception as exc:
+        state["validation_errors"].append(f"LLM validation failed: {exc}")
+        return state
 
-    state["trading_query"] = TradingQuery(
-        action=ActionType(parsed.action),
-        ticker=parsed.ticker.strip(),
-        conditions=conditions,
-        logic=LogicMode(parsed.logic),
-        raw_text=state["raw_text"],
-    )
+    if assessment.needs_clarification:
+        state["needs_clarification"] = True
+        state["clarification_question"] = assessment.clarification_question
+        state["clarification_reason"] = assessment.reason
+        return state
+
+    if not assessment.is_valid:
+        state["validation_errors"].extend(
+            assessment.issues or ["Parsed query failed semantic validation"]
+        )
+        return state
+
+    state["trading_query"] = _build_trading_query(state, parsed)
+    state["needs_clarification"] = False
+    state["clarification_question"] = None
+    state["clarification_reason"] = None
     return state

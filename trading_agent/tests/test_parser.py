@@ -1,15 +1,21 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core import ActionType, ComparisonOperator, LogicMode, NumericCondition
+from core import ActionType, ComparisonOperator, LogicMode, NumericCondition, TradingQuery
+from parser.graph import _build_clarified_text, parse_trading_query
 from parser.graph_state import ParserState
 from parser.nodes import validate_node
-from parser.schema import NumericConditionInput, ParsedQuery
+from parser.schema import NumericConditionInput, ParsedQuery, ValidationAssessment
+
+
+def _valid_assessment() -> ValidationAssessment:
+    return ValidationAssessment(is_valid=True, needs_clarification=False)
 
 
 class TestNumericConditionInput(unittest.TestCase):
@@ -77,6 +83,20 @@ class TestParsedQuery(unittest.TestCase):
         self.assertEqual(len(query.conditions), 2)
 
 
+class TestValidationAssessment(unittest.TestCase):
+    def test_clarification_fields(self):
+        assessment = ValidationAssessment(
+            is_valid=False,
+            needs_clarification=True,
+            clarification_question="Which stock did you mean?",
+            reason="ambiguous_ticker",
+            issues=["Ticker XYZ is not recognized"],
+        )
+        self.assertTrue(assessment.needs_clarification)
+        self.assertEqual(assessment.reason, "ambiguous_ticker")
+
+
+@patch("parser.nodes._call_ollama_validation", return_value=_valid_assessment())
 class TestValidateNode(unittest.TestCase):
     def _base_state(self, parsed_query: ParsedQuery | None = None) -> ParserState:
         return {
@@ -84,10 +104,13 @@ class TestValidateNode(unittest.TestCase):
             "parsed_query": parsed_query,
             "validation_errors": [],
             "needs_clarification": False,
+            "clarification_question": None,
+            "clarification_reason": None,
+            "clarification_history": [],
             "trading_query": None,
         }
 
-    def test_builds_trading_query_from_parsed_query(self):
+    def test_builds_trading_query_from_parsed_query(self, _mock_validation):
         parsed = ParsedQuery(
             action="BUY",
             ticker="AAPL",
@@ -115,7 +138,7 @@ class TestValidateNode(unittest.TestCase):
             ticker="MSFT", operator=ComparisonOperator.LESS_THAN, value=400.0
         ))
 
-    def test_or_logic_mapped_correctly(self):
+    def test_or_logic_mapped_correctly(self, _mock_validation):
         parsed = ParsedQuery(
             action="SELL",
             ticker="TSLA",
@@ -129,7 +152,7 @@ class TestValidateNode(unittest.TestCase):
         self.assertEqual(result["trading_query"].logic, LogicMode.OR)
         self.assertEqual(result["trading_query"].action, ActionType.SELL)
 
-    def test_strips_ticker_whitespace(self):
+    def test_strips_ticker_whitespace(self, _mock_validation):
         parsed = ParsedQuery(
             action="BUY",
             ticker="  AAPL  ",
@@ -140,13 +163,14 @@ class TestValidateNode(unittest.TestCase):
         self.assertEqual(result["trading_query"].ticker, "AAPL")
         self.assertEqual(result["trading_query"].conditions[0].ticker, "AAPL")
 
-    def test_no_parsed_query_adds_error(self):
+    def test_no_parsed_query_adds_error(self, _mock_validation):
         state = self._base_state()
         result = validate_node(state)
         self.assertIsNone(result["trading_query"])
         self.assertIn("No parsed query to validate", result["validation_errors"])
+        _mock_validation.assert_not_called()
 
-    def test_empty_ticker_adds_error(self):
+    def test_empty_ticker_adds_error(self, _mock_validation):
         parsed = ParsedQuery(
             action="BUY",
             ticker="",
@@ -156,8 +180,9 @@ class TestValidateNode(unittest.TestCase):
         result = validate_node(self._base_state(parsed))
         self.assertIsNone(result["trading_query"])
         self.assertTrue(any("ticker" in e for e in result["validation_errors"]))
+        _mock_validation.assert_not_called()
 
-    def test_empty_condition_ticker_adds_error(self):
+    def test_empty_condition_ticker_adds_error(self, _mock_validation):
         parsed = ParsedQuery(
             action="BUY",
             ticker="AAPL",
@@ -167,8 +192,9 @@ class TestValidateNode(unittest.TestCase):
         result = validate_node(self._base_state(parsed))
         self.assertIsNone(result["trading_query"])
         self.assertTrue(any("condition 0" in e for e in result["validation_errors"]))
+        _mock_validation.assert_not_called()
 
-    def test_all_operators_mapped(self):
+    def test_all_operators_mapped(self, _mock_validation):
         operator_map = {
             ">": ComparisonOperator.GREATER_THAN,
             "<": ComparisonOperator.LESS_THAN,
@@ -185,6 +211,133 @@ class TestValidateNode(unittest.TestCase):
             )
             result = validate_node(self._base_state(parsed))
             self.assertEqual(result["trading_query"].conditions[0].operator, op_enum)
+
+
+class TestValidateNodeClarification(unittest.TestCase):
+    def _base_state(self, parsed_query: ParsedQuery) -> ParserState:
+        return {
+            "raw_text": "Buy apple when price > 150",
+            "parsed_query": parsed_query,
+            "validation_errors": [],
+            "needs_clarification": False,
+            "clarification_question": None,
+            "clarification_reason": None,
+            "clarification_history": [],
+            "trading_query": None,
+        }
+
+    def _parsed(self) -> ParsedQuery:
+        return ParsedQuery(
+            action="BUY",
+            ticker="AAPL",
+            conditions=[NumericConditionInput(ticker="AAPL", operator=">", value=150.0)],
+            logic="AND",
+        )
+
+    @patch(
+        "parser.nodes._call_ollama_validation",
+        return_value=ValidationAssessment(
+            is_valid=False,
+            needs_clarification=True,
+            clarification_question="Which stock did you mean?",
+            reason="ambiguous_ticker",
+            issues=["Ticker uncertain"],
+        ),
+    )
+    def test_sets_needs_clarification_for_ambiguous_ticker(self, _mock_validation):
+        result = validate_node(self._base_state(self._parsed()))
+
+        self.assertTrue(result["needs_clarification"])
+        self.assertEqual(result["clarification_question"], "Which stock did you mean?")
+        self.assertEqual(result["clarification_reason"], "ambiguous_ticker")
+        self.assertIsNone(result["trading_query"])
+        self.assertEqual(result["validation_errors"], [])
+
+    @patch(
+        "parser.nodes._call_ollama_validation",
+        return_value=ValidationAssessment(
+            is_valid=False,
+            needs_clarification=False,
+            issues=["Logic does not match original text"],
+        ),
+    )
+    def test_adds_validation_errors_when_invalid_without_clarification(self, _mock_validation):
+        result = validate_node(self._base_state(self._parsed()))
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertIsNone(result["trading_query"])
+        self.assertIn("Logic does not match original text", result["validation_errors"])
+
+
+class TestClarificationMerge(unittest.TestCase):
+    def test_build_clarified_text_includes_history(self):
+        text = _build_clarified_text(
+            "Buy apple",
+            [("Which stock?", "AAPL")],
+            "What price threshold?",
+            "150",
+        )
+        self.assertIn("Buy apple", text)
+        self.assertIn("Q: Which stock?", text)
+        self.assertIn("A: AAPL", text)
+        self.assertIn("Q: What price threshold?", text)
+        self.assertIn("A: 150", text)
+
+
+class TestParseTradingQueryClarificationLoop(unittest.TestCase):
+    @patch("parser.graph.build_parser_graph")
+    def test_loops_on_clarification_and_returns_query(self, mock_build_graph):
+        mock_graph = mock_build_graph.return_value
+        mock_graph.invoke.side_effect = [
+            {
+                "trading_query": None,
+                "needs_clarification": True,
+                "clarification_question": "Which stock?",
+                "validation_errors": [],
+            },
+            {
+                "trading_query": TradingQuery(
+                    action=ActionType.BUY,
+                    ticker="AAPL",
+                    conditions=[
+                        NumericCondition(
+                            ticker="AAPL",
+                            operator=ComparisonOperator.GREATER_THAN,
+                            value=150.0,
+                        )
+                    ],
+                    logic=LogicMode.AND,
+                    raw_text="Buy apple\n\nClarifications:\nQ: Which stock?\nA: AAPL",
+                ),
+                "needs_clarification": False,
+                "clarification_question": None,
+                "validation_errors": [],
+            },
+        ]
+
+        answers = iter(["AAPL"])
+        query = parse_trading_query("Buy apple", ask_user=lambda q: next(answers))
+
+        self.assertEqual(query.ticker, "AAPL")
+        self.assertEqual(mock_graph.invoke.call_count, 2)
+        second_state = mock_graph.invoke.call_args_list[1][0][0]
+        self.assertIn("Clarifications:", second_state["raw_text"])
+        self.assertIn("A: AAPL", second_state["raw_text"])
+
+    @patch("parser.graph.build_parser_graph")
+    def test_raises_question_when_no_ask_user_callback(self, mock_build_graph):
+        mock_graph = mock_build_graph.return_value
+        mock_graph.invoke.return_value = {
+            "trading_query": None,
+            "needs_clarification": True,
+            "clarification_question": "Which stock?",
+            "validation_errors": [],
+        }
+
+        with self.assertRaises(ValueError) as ctx:
+            parse_trading_query("Buy apple")
+
+        self.assertEqual(str(ctx.exception), "Which stock?")
 
 
 if __name__ == "__main__":
