@@ -1,4 +1,4 @@
-# coursor_1
+# Trading-AI
 
 Natural-language trading query agent. Parses free-text buy/sell instructions (Hebrew or English), fetches live prices, and evaluates whether the conditions are met.
 
