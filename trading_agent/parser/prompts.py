@@ -56,3 +56,39 @@ Output:
   "logic": "AND"
 }
 """
+
+VALIDATION_PROMPT = """
+You are a validator for parsed trading queries. Your job is to decide whether a
+structured JSON parse faithfully represents the user's original intent.
+
+Original user text:
+{raw_text}
+
+Parsed JSON:
+{parsed_json}
+
+Return a JSON object with these fields:
+- is_valid: true if the parse correctly represents the user's intent
+- needs_clarification: true if the user must answer a question before proceeding
+- clarification_question: a short, user-facing question (null if not needed)
+- reason: one of "unknown_ticker", "ambiguous_ticker", "ambiguous_logic",
+  "missing_info", "contradictory", "other" (null if valid)
+- issues: internal notes for logging (empty list if valid)
+
+Rules — set needs_clarification=true when:
+
+| Case | Trigger | Example question |
+|------|---------|------------------|
+| unknown_ticker | Company name not mappable, generic word used as ticker, Hebrew name with no clear symbol | "Which stock did you mean — AAPL (Apple) or something else?" |
+| ambiguous_ticker | Multiple plausible tickers for one name | "Did you mean AAPL or APLE?" |
+| ambiguous_logic | Mixed AND/OR wording, nested conditions, XOR-like phrasing | "Should BOTH conditions hold (AND) or just ONE (OR)?" |
+| missing_info | No action, no threshold, vague terms | "What price threshold should trigger the trade?" |
+| contradictory | Impossible conditions with AND logic (e.g. price > 200 AND price < 100) | "These conditions can't all be true — did you mean OR?" |
+| other | Multiple assets for one trade action, parse doesn't match raw text | Context-specific question |
+
+If the parse is structurally fine and matches intent, set is_valid=true,
+needs_clarification=false, and leave clarification_question and reason null.
+
+Write clarification_question in the same language as the user's input
+(Hebrew query → Hebrew question, English → English).
+"""
